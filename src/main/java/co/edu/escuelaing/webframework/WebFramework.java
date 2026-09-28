@@ -39,19 +39,47 @@ public final class WebFramework {
         server.staticfiles(directory);
     }
 
-    /** Starts the server on the port given by the {@code PORT} variable (default 8080). */
+    /**
+     * Starts the server configured from the environment: {@code PORT} (default 8080),
+     * {@code WORKER_THREADS} and {@code SHUTDOWN_TIMEOUT_SECONDS}.
+     */
     public static void start() throws IOException {
-        start(Config.fromEnvironment().getPort());
+        Config config = Config.fromEnvironment();
+        configure(config);
+        start(config.getPort());
     }
 
-    /** Starts the server on an explicit port. Blocks until {@link #stop()} is called. */
+    /** Applies the concurrency and shutdown settings of {@code config}. Call before starting. */
+    public static void configure(Config config) {
+        server.setWorkerThreads(config.getWorkerThreads());
+        server.setShutdownTimeout(config.getShutdownTimeout());
+    }
+
+    /** Starts the server on an explicit port. Blocks until the server has fully stopped. */
     public static void start(int port) throws IOException {
         server.start(port);
     }
 
-    /** Stops the server gracefully after the current request completes. */
+    /**
+     * Stops the server gracefully: no new connections are accepted and the requests in
+     * progress are allowed to finish. Returns immediately.
+     */
     public static void stop() {
         server.stop();
+    }
+
+    /**
+     * Makes SIGTERM / Ctrl+C (e.g. {@code docker stop}) trigger a graceful shutdown: the JVM
+     * waits for the in-flight requests before exiting.
+     */
+    public static void stopOnJvmShutdown() {
+        HttpServer current = server;
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            if (current.isRunning()) {
+                System.out.println("Shutdown signal received: stopping gracefully...");
+                current.stopAndWait();
+            }
+        }, "graceful-shutdown"));
     }
 
     /** The underlying server, for advanced use and tests. */

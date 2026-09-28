@@ -2,6 +2,7 @@ package co.edu.escuelaing.webframework;
 
 import java.io.BufferedInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.Closeable;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -10,6 +11,7 @@ import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
 import java.util.HashMap;
@@ -17,21 +19,33 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * The HTTP infrastructure: accepts TCP connections, parses requests, asks the
  * {@link Router} for a dynamic handler, falls back to the {@link StaticFileService}
  * and writes the response.
  *
- * <p><b>The server is strictly sequential</b>: one connection is accepted, fully served
- * and closed before the next one is accepted. There are no worker threads, thread pools
- * or asynchronous execution. The loop below never mentions a concrete route; adding a
- * service means calling {@link #get(String, RouteHandler)}, not editing this class.
+ * <p><b>The server is concurrent</b>: the accept loop only accepts connections and hands
+ * each one to a bounded pool of worker threads, so a slow request no longer blocks the
+ * others. The loop below never mentions a concrete route; adding a service means calling
+ * {@link #get(String, RouteHandler)}, not editing this class.
+ *
+ * <p><b>Shutdown is graceful</b>: {@link #stop()} closes the listening socket (no new
+ * connections are accepted), then the requests already in progress are allowed to finish
+ * for up to {@link #setShutdownTimeout(Duration) the shutdown timeout} before the workers
+ * are interrupted.
  */
 public final class HttpServer {
 
     static final String DEFAULT_STATIC_FOLDER = "/webroot";
+    static final int DEFAULT_WORKER_THREADS = 16;
+    static final Duration DEFAULT_SHUTDOWN_TIMEOUT = Duration.ofSeconds(10);
 
     private static final int MAX_LINE_BYTES = 8 * 1024;
     private static final int MAX_HEADERS = 100;
@@ -39,17 +53,20 @@ public final class HttpServer {
 
     private final Router router = new Router();
     private final CountDownLatch started = new CountDownLatch(1);
+    private final CountDownLatch stopped = new CountDownLatch(1);
+    private final AtomicInteger activeRequests = new AtomicInteger();
 
     private volatile StaticFileService staticFiles = StaticFileService.fromClasspath(DEFAULT_STATIC_FOLDER);
     private volatile boolean running;
     private volatile ServerSocket serverSocket;
-    private volatile Thread serverThread;
     private volatile int port = -1;
+    private volatile int workerThreads = DEFAULT_WORKER_THREADS;
+    private volatile Duration shutdownTimeout = DEFAULT_SHUTDOWN_TIMEOUT;
 
     /**
-     * How long the server waits for a client to send its request. Without this limit a
-     * client that connects and stays silent (browsers do this to pre-connect) would block
-     * the whole sequential server.
+     * How long a worker waits for a client to send its request. Without this limit a
+     * client that connects and stays silent (browsers do this to pre-connect) would keep
+     * a worker thread busy forever.
      */
     private volatile int clientTimeoutMillis = 5_000;
 
@@ -74,56 +91,74 @@ public final class HttpServer {
 
     /**
      * Binds to all network interfaces on {@code port} (0 = any free port) and serves
-     * requests, one at a time, until {@link #stop()} is called. Blocks the calling thread.
+     * requests concurrently until {@link #stop()} is called. Blocks the calling thread
+     * until the server has fully stopped, including the requests that were in progress.
      */
     public void start(int port) throws IOException {
-        if (running) {
-            throw new IllegalStateException("Server is already running");
+        if (running || started.getCount() == 0) {
+            throw new IllegalStateException("A server instance can only be started once");
         }
+        ExecutorService workers = Executors.newFixedThreadPool(workerThreads, workerThreadFactory());
         // new ServerSocket(port) binds to the wildcard address (0.0.0.0), NOT only to
         // localhost, so a cloud platform / Docker port mapping can reach it.
         try (ServerSocket socket = new ServerSocket(port)) {
             this.serverSocket = socket;
-            this.serverThread = Thread.currentThread();
             this.port = socket.getLocalPort();
             this.running = true;
             started.countDown();
-            log("Server listening on 0.0.0.0:" + this.port);
+            log("Server listening on 0.0.0.0:" + this.port + " with " + workerThreads + " worker threads");
 
             while (running) {
-                try (Socket client = socket.accept()) {
-                    handle(client);
+                Socket client;
+                try {
+                    client = socket.accept();
                 } catch (IOException e) {
                     if (running) {
-                        log("Connection error: " + e.getMessage());
+                        log("Accept error: " + e.getMessage());
                     }
+                    if (socket.isClosed()) {
+                        break;
+                    }
+                    continue;
+                }
+                try {
+                    workers.execute(() -> serve(client));
+                } catch (RejectedExecutionException e) {
+                    closeQuietly(client); // only happens while shutting down
                 }
             }
         } finally {
             running = false;
             serverSocket = null;
-            serverThread = null;
+            drain(workers);
+            stopped.countDown();
         }
         log("Server stopped gracefully.");
     }
 
     /**
-     * Requests a graceful stop. It never interrupts the request being served: the
-     * current response is sent and the connection closed, then the loop ends and the
-     * {@link ServerSocket} is closed.
-     *
-     * <p>Called from inside a route (the normal case, e.g. {@code /shutdown}) it only
-     * clears the {@code running} flag. Called from another thread it also closes the
-     * listening socket so the blocked {@code accept()} returns immediately.
+     * Requests a graceful stop and returns immediately. The listening socket is closed so
+     * no new connection is accepted; requests already in progress (including the one that
+     * called {@code stop()}, e.g. {@code /shutdown}) finish and send their responses.
+     * Use {@link #awaitStopped(long, TimeUnit)} to wait for the end of the shutdown.
      */
     public void stop() {
         running = false;
-        ServerSocket socket = serverSocket;
-        if (socket != null && Thread.currentThread() != serverThread) {
+        closeQuietly(serverSocket);
+    }
+
+    /**
+     * Stops the server and waits (up to the shutdown timeout plus a small margin) until
+     * the in-flight requests have completed. Intended for JVM shutdown hooks, so that
+     * {@code docker stop} / SIGTERM does not cut requests in half.
+     */
+    public void stopAndWait() {
+        stop();
+        if (started.getCount() == 0) {
             try {
-                socket.close();
-            } catch (IOException ignored) {
-                // nothing else to do: we are already shutting down
+                awaitStopped(shutdownTimeout.toMillis() + 2_000, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
             }
         }
     }
@@ -137,13 +172,78 @@ public final class HttpServer {
         return port;
     }
 
+    /** Number of requests being processed right now. */
+    public int getActiveRequests() {
+        return activeRequests.get();
+    }
+
     /** Waits until the server socket is bound. Mostly useful for tests. */
     public boolean awaitStarted(long timeout, TimeUnit unit) throws InterruptedException {
         return started.await(timeout, unit);
     }
 
+    /** Waits until the server has stopped and every in-flight request has finished. */
+    public boolean awaitStopped(long timeout, TimeUnit unit) throws InterruptedException {
+        return stopped.await(timeout, unit);
+    }
+
+    /** Size of the worker pool. Must be called before {@link #start(int)}. */
+    public void setWorkerThreads(int threads) {
+        if (threads < 1) {
+            throw new IllegalArgumentException("Worker threads must be at least 1");
+        }
+        this.workerThreads = threads;
+    }
+
+    /** Maximum time {@link #stop()} lets in-flight requests run before interrupting them. */
+    public void setShutdownTimeout(Duration timeout) {
+        if (timeout.isNegative()) {
+            throw new IllegalArgumentException("Shutdown timeout cannot be negative");
+        }
+        this.shutdownTimeout = timeout;
+    }
+
     void setClientTimeoutMillis(int millis) {
         this.clientTimeoutMillis = millis;
+    }
+
+    /** Lets in-flight requests finish, then interrupts whatever is still running. */
+    private void drain(ExecutorService workers) {
+        workers.shutdown();
+        int inFlight = activeRequests.get();
+        if (inFlight > 0) {
+            log("Waiting for " + inFlight + " in-flight request(s) to finish...");
+        }
+        try {
+            if (!workers.awaitTermination(shutdownTimeout.toMillis(), TimeUnit.MILLISECONDS)) {
+                log("Shutdown timeout reached; interrupting " + activeRequests.get() + " request(s)");
+                workers.shutdownNow();
+                workers.awaitTermination(1, TimeUnit.SECONDS);
+            }
+        } catch (InterruptedException e) {
+            workers.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    private static ThreadFactory workerThreadFactory() {
+        AtomicInteger counter = new AtomicInteger();
+        return task -> {
+            Thread thread = new Thread(task, "http-worker-" + counter.incrementAndGet());
+            thread.setDaemon(true);
+            return thread;
+        };
+    }
+
+    private static void closeQuietly(Closeable closeable) {
+        if (closeable == null) {
+            return;
+        }
+        try {
+            closeable.close();
+        } catch (IOException ignored) {
+            // nothing else to do: the resource is being discarded
+        }
     }
 
     // ------------------------------------------------------------- request processing
@@ -180,6 +280,18 @@ public final class HttpServer {
             // A failing handler must never take the server down.
             log("Error while handling " + request + ": " + e);
             return Response.text(500, "500 Internal Server Error");
+        }
+    }
+
+    /** Runs on a worker thread: serves one connection and always closes it. */
+    private void serve(Socket client) {
+        activeRequests.incrementAndGet();
+        try (client) {
+            handle(client);
+        } catch (IOException e) {
+            log("Error while closing connection: " + e.getMessage());
+        } finally {
+            activeRequests.decrementAndGet();
         }
     }
 
@@ -286,6 +398,6 @@ public final class HttpServer {
     }
 
     private static void log(String message) {
-        System.out.println("[" + LocalTime.now().format(TIME) + "] " + message);
+        System.out.println("[" + LocalTime.now().format(TIME) + "] [" + Thread.currentThread().getName() + "] " + message);
     }
 }

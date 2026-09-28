@@ -1,9 +1,12 @@
 package co.edu.escuelaing.app;
 
+import static co.edu.escuelaing.webframework.WebFramework.configure;
 import static co.edu.escuelaing.webframework.WebFramework.get;
+import static co.edu.escuelaing.webframework.WebFramework.server;
 import static co.edu.escuelaing.webframework.WebFramework.start;
 import static co.edu.escuelaing.webframework.WebFramework.staticfiles;
 import static co.edu.escuelaing.webframework.WebFramework.stop;
+import static co.edu.escuelaing.webframework.WebFramework.stopOnJvmShutdown;
 
 import co.edu.escuelaing.webframework.Config;
 import java.nio.file.Path;
@@ -17,16 +20,22 @@ import java.nio.file.Path;
  */
 public final class Application {
 
+    static final long MAX_SLOW_MILLIS = 10_000;
+
     private Application() {
     }
 
     public static void main(String[] args) throws Exception {
         Config config = Config.fromEnvironment();
-        int port = config.getPort(); // fail fast if PORT is invalid
+        int port = config.getPort(); // fail fast if PORT, WORKER_THREADS... are invalid
+        configure(config);
 
         registerRoutes(config);
+        stopOnJvmShutdown(); // docker stop (SIGTERM) -> finish in-flight requests, then exit
 
         System.out.println("APP_ENV=" + config.getAppEnv()
+                + " | workers=" + config.getWorkerThreads()
+                + " | shutdown timeout=" + config.getShutdownTimeout().toSeconds() + "s"
                 + " | shutdown route " + (config.isDevelopment() ? "ENABLED" : "DISABLED"));
 
         start(port);
@@ -75,7 +84,34 @@ public final class Application {
             return "{\"appEnv\":\"" + jsonEscape(config.getAppEnv()) + "\","
                     + "\"greetingPrefix\":\"" + jsonEscape(config.get("GREETING_PREFIX", "Hello")) + "\","
                     + "\"port\":" + config.getPort() + ","
+                    + "\"workerThreads\":" + config.getWorkerThreads() + ","
+                    + "\"shutdownTimeoutSeconds\":" + config.getShutdownTimeout().toSeconds() + ","
                     + "\"shutdownEnabled\":" + config.isDevelopment() + "}";
+        });
+
+        // GET /slow?ms=2000 -> answers after a delay. Used to show that several slow requests
+        // are served in parallel and that a shutdown waits for them to finish.
+        get("/slow", (req, resp) -> {
+            long millis;
+            try {
+                String value = req.getValue("ms");
+                millis = value == null ? 2_000 : Long.parseLong(value);
+            } catch (NumberFormatException e) {
+                millis = -1;
+            }
+            if (millis < 0 || millis > MAX_SLOW_MILLIS) {
+                resp.setStatus(400);
+                return "Parameter 'ms' must be a whole number between 0 and " + MAX_SLOW_MILLIS;
+            }
+            Thread.sleep(millis);
+            return "Done after " + millis + " ms on " + Thread.currentThread().getName();
+        });
+
+        // GET /status -> worker that served the request and requests currently in progress.
+        get("/status", (req, resp) -> {
+            resp.setContentType("application/json; charset=UTF-8");
+            return "{\"thread\":\"" + jsonEscape(Thread.currentThread().getName()) + "\","
+                    + "\"activeRequests\":" + server().getActiveRequests() + "}";
         });
 
         // GET /shutdown -> only registered in development. In production the route does

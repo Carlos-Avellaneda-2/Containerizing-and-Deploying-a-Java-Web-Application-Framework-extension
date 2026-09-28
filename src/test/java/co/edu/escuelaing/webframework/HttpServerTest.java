@@ -18,16 +18,28 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 /**
- * End-to-end tests over real TCP sockets. The server under test is sequential; the
- * background thread below only exists so the test itself can act as the client.
+ * End-to-end tests over real TCP sockets. The server runs its accept loop on a background
+ * thread so the test itself can act as the client.
  */
 class HttpServerTest {
+
+    private static final long SLOW_MILLIS = 1_000;
+
+    /** Released by the /block route when it starts, so a test knows a request is in flight. */
+    private final CountDownLatch blockedRequestStarted = new CountDownLatch(1);
 
     private final HttpClient client = HttpClient.newBuilder()
             .version(HttpClient.Version.HTTP_1_1)
@@ -55,6 +67,15 @@ class HttpServerTest {
         server.get("/stop", (req, resp) -> {
             server.stop();
             return "Server will stop after this response.";
+        });
+        server.get("/slow", (req, resp) -> {
+            Thread.sleep(SLOW_MILLIS);
+            return "slow done";
+        });
+        server.get("/block", (req, resp) -> {
+            blockedRequestStarted.countDown();
+            Thread.sleep(SLOW_MILLIS);
+            return "finished during shutdown";
         });
 
         serverThread = new Thread(() -> {
@@ -223,13 +244,53 @@ class HttpServerTest {
 
     @Test
     @SuppressWarnings("try") // the socket is only held open on purpose
-    void aSilentClientCannotBlockTheSequentialServerForever() throws Exception {
-        server.setClientTimeoutMillis(300);
-
+    void aSilentClientDoesNotBlockOtherClients() throws Exception {
         try (Socket silent = new Socket("127.0.0.1", port)) { // connects, sends nothing
-            assertTimeoutPreemptively(Duration.ofSeconds(4),
+            assertTimeoutPreemptively(Duration.ofSeconds(2),
                     () -> assertEquals("Hello Ana", get("/hello?name=Ana").body()));
         }
+    }
+
+    // ------------------------------------------------------------------ concurrency
+
+    @Test
+    void slowRequestsAreServedInParallel() throws Exception {
+        int clients = 8;
+        ExecutorService pool = Executors.newFixedThreadPool(clients);
+        try {
+            long begin = System.nanoTime();
+            List<Future<HttpResponse<String>>> responses = new ArrayList<>();
+            for (int i = 0; i < clients; i++) {
+                responses.add(pool.submit(() -> get("/slow")));
+            }
+            for (Future<HttpResponse<String>> response : responses) {
+                assertEquals("slow done", response.get(10, TimeUnit.SECONDS).body());
+            }
+            long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - begin);
+
+            // sequentially this would take clients * SLOW_MILLIS = 8 s
+            assertTrue(elapsedMillis < 3 * SLOW_MILLIS, "took " + elapsedMillis + " ms");
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
+    void fastRequestsAreNotBlockedByASlowOne() throws Exception {
+        CompletableFuture<HttpResponse<String>> slow = CompletableFuture.supplyAsync(() -> {
+            try {
+                return get("/slow");
+            } catch (Exception e) {
+                throw new IllegalStateException(e);
+            }
+        });
+
+        long begin = System.nanoTime();
+        assertEquals(String.valueOf(Math.PI), get("/pi").body());
+        long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - begin);
+
+        assertTrue(elapsedMillis < SLOW_MILLIS / 2, "fast request took " + elapsedMillis + " ms");
+        assertEquals("slow done", slow.get(5, TimeUnit.SECONDS).body());
     }
 
     // ------------------------------------------------------------ graceful shutdown
@@ -259,6 +320,77 @@ class HttpServerTest {
         serverThread.join(5_000);
         assertFalse(serverThread.isAlive());
         assertFalse(server.isRunning());
+        assertTrue(server.awaitStopped(0, TimeUnit.SECONDS));
+    }
+
+    @Test
+    void stopWaitsForInFlightRequestsAndRefusesNewOnes() throws Exception {
+        CompletableFuture<HttpResponse<String>> inFlight = CompletableFuture.supplyAsync(() -> {
+            try {
+                return get("/block");
+            } catch (Exception e) {
+                throw new IllegalStateException(e);
+            }
+        });
+        assertTrue(blockedRequestStarted.await(5, TimeUnit.SECONDS));
+        assertEquals(1, server.getActiveRequests());
+
+        server.stop();
+
+        // no new connection is accepted while the old request is still running
+        assertThrows(ConnectException.class, () -> new Socket("127.0.0.1", port).close());
+        assertFalse(server.awaitStopped(100, TimeUnit.MILLISECONDS), "must wait for the request");
+
+        // the in-flight request completes normally, then the server finishes stopping
+        HttpResponse<String> response = inFlight.get(5, TimeUnit.SECONDS);
+        assertEquals(200, response.statusCode());
+        assertEquals("finished during shutdown", response.body());
+        assertTrue(server.awaitStopped(5, TimeUnit.SECONDS));
+        assertEquals(0, server.getActiveRequests());
+    }
+
+    @Test
+    void shutdownTimeoutInterruptsRequestsThatTakeTooLong() throws Exception {
+        HttpServer quick = new HttpServer();
+        quick.setShutdownTimeout(Duration.ofMillis(200));
+        CountDownLatch started = new CountDownLatch(1);
+        quick.get("/forever", (req, resp) -> {
+            started.countDown();
+            Thread.sleep(60_000);
+            return "never";
+        });
+        Thread thread = new Thread(() -> {
+            try {
+                quick.start(0);
+            } catch (IOException e) {
+                throw new IllegalStateException(e);
+            }
+        });
+        thread.start();
+        assertTrue(quick.awaitStarted(5, TimeUnit.SECONDS));
+        int quickPort = quick.getPort();
+        CompletableFuture.runAsync(() -> {
+            try (Socket socket = new Socket("127.0.0.1", quickPort)) {
+                socket.getOutputStream().write("GET /forever HTTP/1.1\r\n\r\n".getBytes(StandardCharsets.US_ASCII));
+                socket.getInputStream().readAllBytes();
+            } catch (IOException ignored) {
+                // the connection is cut when the worker is interrupted
+            }
+        });
+        assertTrue(started.await(5, TimeUnit.SECONDS));
+
+        long begin = System.nanoTime();
+        quick.stop();
+        assertTrue(quick.awaitStopped(5, TimeUnit.SECONDS));
+
+        assertTrue(TimeUnit.NANOSECONDS.toSeconds(System.nanoTime() - begin) < 3);
+        thread.join(5_000);
+        assertFalse(thread.isAlive());
+    }
+
+    @Test
+    void aServerInstanceCannotBeStartedTwice() {
+        assertThrows(IllegalStateException.class, () -> server.start(0));
     }
 
     // --------------------------------------------------------------------- helpers

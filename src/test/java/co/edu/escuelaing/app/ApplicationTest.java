@@ -104,6 +104,35 @@ class ApplicationTest {
         assertTrue(json.contains("\"shutdownEnabled\":false"), json);
     }
 
+    @Test
+    void slowAnswersAfterTheRequestedDelay() throws Exception {
+        Application.registerRoutes(DEVELOPMENT);
+
+        Response response = call("GET /slow?ms=10 HTTP/1.1");
+
+        assertEquals(200, response.getStatus());
+        assertTrue(response.getBodyAsString().startsWith("Done after 10 ms"));
+    }
+
+    @Test
+    void slowRejectsInvalidDelays() throws Exception {
+        Application.registerRoutes(DEVELOPMENT);
+
+        assertEquals(400, call("GET /slow?ms=-1 HTTP/1.1").getStatus());
+        assertEquals(400, call("GET /slow?ms=abc HTTP/1.1").getStatus());
+        assertEquals(400, call("GET /slow?ms=999999 HTTP/1.1").getStatus());
+    }
+
+    @Test
+    void statusReportsActiveRequestsAsJson() throws Exception {
+        Application.registerRoutes(DEVELOPMENT);
+
+        Response response = call("GET /status HTTP/1.1");
+
+        assertTrue(response.getContentType().startsWith("application/json"));
+        assertTrue(response.getBodyAsString().contains("\"activeRequests\":"));
+    }
+
     // ------------------------------------------------------ static files & fallback
 
     @Test

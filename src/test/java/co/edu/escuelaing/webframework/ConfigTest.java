@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.time.Duration;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -35,6 +36,31 @@ class ConfigTest {
                 () -> new Config(Map.of("PORT", value)).getPort());
 
         assertTrue(error.getMessage().contains("PORT"));
+    }
+
+    @Test
+    void workerThreadsAndShutdownTimeoutHaveDefaults() {
+        Config config = new Config(Map.of());
+
+        assertEquals(16, config.getWorkerThreads());
+        assertEquals(Duration.ofSeconds(10), config.getShutdownTimeout());
+    }
+
+    @Test
+    void workerThreadsAndShutdownTimeoutAreReadFromTheEnvironment() {
+        Config config = new Config(Map.of("WORKER_THREADS", "4", "SHUTDOWN_TIMEOUT_SECONDS", "30"));
+
+        assertEquals(4, config.getWorkerThreads());
+        assertEquals(Duration.ofSeconds(30), config.getShutdownTimeout());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"0", "-3", "many", "5000"})
+    void invalidWorkerThreadsFailWithAClearMessage(String value) {
+        IllegalArgumentException error = assertThrows(IllegalArgumentException.class,
+                () -> new Config(Map.of("WORKER_THREADS", value)).getWorkerThreads());
+
+        assertTrue(error.getMessage().contains("WORKER_THREADS"));
     }
 
     @Test
