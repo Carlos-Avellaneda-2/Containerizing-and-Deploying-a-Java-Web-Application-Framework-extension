@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Lambda Web Framework</title>
+    <link rel="icon" type="image/png" href="/images/logo.png">
+    <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+    <header class="hero">
+        <img src="/images/logo.png" alt="Lambda logo" width="96" height="96">
+        <div>
+            <h1>Lambda Web Framework</h1>
+            <p>A tiny sequential HTTP server with lambda routes and static files.</p>
+        </div>
+    </header>
+
+    <main>
+        <section class="card">
+            <h2>Greeting <code>GET /hello</code></h2>
+            <form id="greet-form">
+                <label for="name">Your name</label>
+                <div class="row">
+                    <input id="name" name="name" type="text" placeholder="Pedro" autocomplete="off">
+                    <button type="submit">Greet</button>
+                </div>
+            </form>
+            <p class="result" id="greet-result" aria-live="polite">&nbsp;</p>
+        </section>
+
+        <section class="card">
+            <h2>Pi <code>GET /pi</code></h2>
+            <button id="pi-button" type="button">Get π</button>
+            <p class="result" id="pi-result" aria-live="polite">&nbsp;</p>
+        </section>
+
+        <section class="card">
+            <h2>Addition <code>GET /add?a=&amp;b=</code></h2>
+            <form id="add-form">
+                <div class="row">
+                    <input id="a" type="number" placeholder="a" aria-label="First number" required>
+                    <input id="b" type="number" placeholder="b" aria-label="Second number" required>
+                    <button type="submit">Add</button>
+                </div>
+            </form>
+            <p class="result" id="add-result" aria-live="polite">&nbsp;</p>
+        </section>
+
+        <section class="card">
+            <h2>Deployment <code>GET /config</code></h2>
+            <button id="config-button" type="button">Show configuration</button>
+            <pre class="result" id="config-result" aria-live="polite">&nbsp;</pre>
+        </section>
+
+        <section class="card links">
+            <h2>Try it by hand</h2>
+            <ul>
+                <li><a href="/hello?name=Pedro">/hello?name=Pedro</a></li>
+                <li><a href="/pi">/pi</a></li>
+                <li><a href="/add?a=2&amp;b=3">/add?a=2&amp;b=3</a></li>
+                <li><a href="/config">/config</a></li>
+                <li><a href="/styles.css">/styles.css</a> · <a href="/app.js">/app.js</a> · <a href="/images/logo.png">/images/logo.png</a></li>
+                <li><a href="/unknown">/unknown</a> (expected: 404)</li>
+            </ul>
+        </section>
+    </main>
+
+    <footer>Built with plain Java sockets · no external libraries</footer>
+
+    <script src="/app.js"></script>
+</body>
+</html>
