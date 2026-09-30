@@ -8,6 +8,13 @@ Extensión del **framework web propio del curso** (sin Spring) para cumplir el *
 - corre en un **contenedor Docker** basado en Amazon Corretto 21,
 - está **desplegado en una instancia AWS EC2**.
 
+| Recurso | Enlace |
+|---|---|
+| Video de demostración (despliegue local con Docker y en EC2) | [youtu.be/rlmp5gFdka4](https://youtu.be/rlmp5gFdka4) |
+| Imagen en Docker Hub | [hub.docker.com/r/carlosavellaneda1/webframework](https://hub.docker.com/r/carlosavellaneda1/webframework) |
+| Despliegue público (EC2) | [http://54.91.111.81/](http://54.91.111.81/) |
+| Repositorio 1 (workshop con Spring Boot) | [Workshop-implementation](https://github.com/Carlos-Avellaneda-2/Containerizing-and-Deploying-a-Java-Web-Application-Workshop-implementation) |
+
 ## Contenido
 
 - [Estado del framework](#estado-del-framework)
