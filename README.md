@@ -179,7 +179,7 @@ flowchart TD
     APP --> POOL[Pool de workers http-worker-1..16]
 ```
 
-**URL pública:** [http://54.90.132.138/](http://54.90.132.138/) — por ejemplo [http://54.90.132.138/hello?name=EC2](http://54.90.132.138/hello?name=EC2) *(disponible mientras la instancia esté encendida; la IP pública cambia si la instancia se detiene y se vuelve a iniciar)*.
+**URL pública:** [http://54.91.111.81/](http://54.91.111.81/) — por ejemplo [http://54.91.111.81/hello?name=EC2](http://54.91.111.81/hello?name=EC2) *(disponible mientras la instancia esté encendida; la IP pública cambia si la instancia se detiene y se vuelve a iniciar)*.
 
 Salida obtenida en la instancia EC2:
 
@@ -222,7 +222,7 @@ Cinco peticiones de 3 s terminaron en 3 s en total (en paralelo, en workers dist
 |---|---|---|
 | 1 | Contenedor local (`localhost:35000`) respondiendo `/hello?name=Docker` con `GREETING_PREFIX=Hola` | ![Docker local hello](docs/evidence/local-docker-hello.png) |
 | 2 | Contenedor local: `/config` con la configuración leída de variables de entorno | ![Docker local config](docs/evidence/local-docker-config.png) |
-| 3 | EC2: página estática servida por el framework en `http://54.90.132.138/` | ![EC2 index](docs/evidence/ec2-index.png) |
+| 3 | EC2: página estática servida por el framework en `http://54.91.111.81/` | ![EC2 index](docs/evidence/ec2-index.png) |
 | 4 | EC2: `/hello?name=EC2` | ![EC2 hello](docs/evidence/ec2-hello.png) |
 | 5 | EC2: `/config` en producción (`shutdownEnabled: false`, 16 workers) | ![EC2 config](docs/evidence/ec2-config.png) |
 | 6 | EC2: `/slow?ms=1500` atendida por un worker del pool | ![EC2 slow](docs/evidence/ec2-slow.png) |
